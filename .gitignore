@@ -1,0 +1,6 @@
+# Zig build artifacts and caches (regenerable via `zig build` / `zig build --fetch`)
+.zig-cache/
+zig-out/
+zig-pkg/
+
+.DS_Store
