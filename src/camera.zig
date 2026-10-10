@@ -20,22 +20,17 @@ pub const Camera = struct {
 
     //https://www.scratchapixel.com/lessons/mathematics-physics-for-computer-graphics/lookat-function//framing-lookat-function.html
     pub fn lookAt(self: *Camera, target: rl.Vector3) void {
-        // 100% bien
         self.Forward = target.subtract(self.Postition).normalize();
 
-        // Luego usamos producto cruz para sacar al vector que define
-        // a la derecha porque eso nos dará un vector normal al plano
-        // definido por forward y algún otro vector, y eso hará que right sea
-        // perpendicular a ambos.
-        // Esta estimación es 2-3, porque necesitamos otro vector para sacar el
-        // producto cruz y este debe ser up, pero en esta misma función redefine up también.
-        // Usamos up, asumiendo que no está muy lejos del nuevo up que calcularemos.
-        // El orden del operación importa, si ponemos Forward primero, calcularmos Left, no Right
-        self.Right = rl.Vector3.crossProduct(self.Up, self.Forward).normalize();
+        // Usamos siempre el "arriba" del mundo como vector auxiliar (en vez del Up
+        // anterior de la cámara) para que no se acumule error entre frames.
+        // Con producto cruz sacamos un vector perpendicular a Forward y al arriba del
+        // mundo: ese es Right. El orden importa: Forward x Up da Right (Up x Forward da Left),
+        // así la imagen no sale en espejo.
+        const world_up = rl.Vector3{ .x = 0, .y = 1, .z = 0 };
+        self.Right = rl.Vector3.crossProduct(self.Forward, world_up).normalize();
 
-        // En este caso, Up sí cumplirá con ser 100% perpendicular a right y forward,
-        // pero tiene el error transitivo de right.
-        // De nuevo, el orden importa, si ponemos Right primero, calcularmos Down, no Up
-        self.Up = rl.Vector3.crossProduct(self.Forward, self.Right).normalize();
+        // Up sí queda 100% perpendicular a Right y Forward.
+        self.Up = rl.Vector3.crossProduct(self.Right, self.Forward).normalize();
     }
 };
