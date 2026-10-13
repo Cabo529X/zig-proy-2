@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const tex = @import("../texture.zig");
+const Material = @import("../raytracer.zig").Material;
 
 const rl = @import("raylib");
 const Vec3 = rl.Vector3;
@@ -36,4 +37,14 @@ pub fn textura(gpa: std.mem.Allocator) !Texture {
         }
     }
     return t;
+}
+
+pub fn material(textura_ptr: *const Texture) Material {
+    return .{
+        .Color = .{ .x = 1, .y = 1, .z = 1 },
+        .Textura = textura_ptr,
+        .Especular = 8,
+        .Refractive_index = 0,
+        .Propiedades = .{ .Albedo = 0.95, .Especular = 0.05, .Reflectividad = 0, .Transparencia = 0 },
+    };
 }
