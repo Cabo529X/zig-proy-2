@@ -1,373 +1,212 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 const rl = @import("raylib");
 const Framebuffer = @import("framebuffer.zig").Framebuffer;
-const Forma = @import("formas.zig").Forma;
 const Camera = @import("camera.zig").Camera;
-const Light = @import("raytracer.zig").Light;
-const Intersect = @import("raytracer.zig").Intersect;
-const Material = @import("raytracer.zig").Material;
-
-const htmlColor = @import("cute_colors.zig").htmlColor;
-const V3FromColor = @import("raytracer.zig").V3FromColor;
-const V3ToColor = @import("raytracer.zig").V3ToColor;
-
-const Clock = std.Io.Clock.real;
+const World = @import("scene.zig").World;
+const tracer = @import("tracer.zig");
 
 const width = 1300;
 const height = 900;
 
-const block_sz = 100;
+// Mientras la cámara se mueve renderizamos a menor resolución para que sea interactivo;
+// cuando se queda quieta renderizamos una vez a resolución completa.
+// La tecla M cambia entre estos factores (1 = resolución completa también al moverse).
+const motion_scales = [_]i32{ 4, 2, 1 };
 
-pub fn main() !void {
-    var alloc = switch (builtin.mode) {
-        .Debug, .ReleaseSafe => std.heap.DebugAllocator(.{}).init,
-        .ReleaseFast, .ReleaseSmall => std.heap.smp_allocator,
-    };
-    const gpa: std.mem.Allocator = switch (builtin.mode) {
-        .Debug, .ReleaseSafe => alloc.allocator(),
-        .ReleaseFast, .ReleaseSmall => std.heap.smp_allocator,
-    };
-    defer switch (builtin.mode) {
-        .Debug, .ReleaseSafe => _ = alloc.deinit(),
-        .ReleaseFast, .ReleaseSmall => {},
-    };
+const target = rl.Vector3{ .x = 0, .y = 1, .z = 0 };
+const default_x_angle: f32 = 1.0;
+const default_y_angle: f32 = 0.5;
+const default_distance: f32 = 11;
+const distance_min: f32 = 4;
+const distance_max: f32 = 40;
 
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    const io = threaded.io();
-    var framebuffer = Framebuffer.init(width, height, .black, .white);
+/// Pone la cámara en una esfera alrededor del objetivo.
+/// x es el giro horizontal, y la inclinación.
+fn placeCamera(camera: *Camera, x_angle: f32, y_angle: f32, distance: f32) void {
+    camera.Postition = .{
+        .x = target.x + @cos(x_angle) * @cos(y_angle) * distance,
+        .y = target.y + @sin(y_angle) * distance,
+        .z = target.z + @sin(x_angle) * @cos(y_angle) * distance,
+    };
+    camera.lookAt(target);
+}
 
-    rl.initWindow(width, height, "Raytracer!!!");
+/// Modo sin ventana: renderiza un solo cuadro a un PNG.
+///   proyecto_02 --render salida.png [ancho alto [giro inclinacion distancia]]
+fn renderToFile(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
+    const parse = std.fmt.parseFloat;
+    const out_path = args[0];
+    const out_width: i32 = if (args.len > 2) try std.fmt.parseInt(i32, args[1], 10) else width;
+    const out_height: i32 = if (args.len > 2) try std.fmt.parseInt(i32, args[2], 10) else height;
+    const x_angle: f32 = if (args.len > 5) try parse(f32, args[3]) else default_x_angle;
+    const y_angle: f32 = if (args.len > 5) try parse(f32, args[4]) else default_y_angle;
+    const distance: f32 = if (args.len > 5) try parse(f32, args[5]) else default_distance;
+
+    const world = try World.init(gpa);
+    defer world.deinit(gpa);
+    const scene = world.scene();
+
+    var framebuffer = try Framebuffer.initCpu(gpa, out_width, out_height);
+    defer framebuffer.deinit(gpa);
+
+    var camera: Camera = .init(.{ .x = 0, .y = 0, .z = 14 }, target);
+    placeCamera(&camera, x_angle, y_angle, distance);
+
+    const thread_count = std.Thread.getCpuCount() catch 4;
+    const clock = std.Io.Clock.real;
+    const start = clock.now(io);
+    tracer.render(&framebuffer, &scene, camera, thread_count);
+    const ms: f64 = @as(f64, @floatFromInt(start.durationTo(clock.now(io)).toMicroseconds())) / 1000;
+    std.debug.print("render {d}x{d} con {d} hilos: {d:.0} ms\n", .{ out_width, out_height, thread_count, ms });
+    try framebuffer.render_to_file(out_path);
+}
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len > 2 and std.mem.eql(u8, args[1], "--render")) {
+        return renderToFile(gpa, init.io, args[2..]);
+    }
+
+    rl.initWindow(width, height, "Diorama - Raytracer");
     rl.setTraceLogLevel(.warning);
     defer rl.closeWindow();
     rl.setTargetFPS(60);
 
-    var last_frame_time = Clock.now(io);
-    var delta: i64 = 1;
+    const thread_count = std.Thread.getCpuCount() catch 4;
 
-    const espejo = Material{
-        .Color = V3FromColor(htmlColor("#fff")),
-        .Propiedades = .{
-            .Albedo = 0,
-            .Especular = 1,
-            .Reflectividad = 0.9,
-            .Transparencia = 0,
-        },
-        .Especular = 100,
-        .Refractive_index = 0,
-    };
+    const world = try World.init(gpa);
+    defer world.deinit(gpa);
+    const scene = world.scene();
 
-    const vidrio = Material{
-        .Color = V3FromColor(htmlColor("#aaa")),
-        .Propiedades = .{
-            .Albedo = 0,
-            .Especular = 0.5,
-            .Reflectividad = 0.1,
-            .Transparencia = 0.8,
-        },
-        .Especular = 125,
-        .Refractive_index = 1.5,
-    };
+    // Un framebuffer por cada resolución con la que renderizamos
+    var fb_quarter = try Framebuffer.init(gpa, width / 4, height / 4);
+    defer fb_quarter.deinit(gpa);
+    var fb_half = try Framebuffer.init(gpa, width / 2, height / 2);
+    defer fb_half.deinit(gpa);
+    var fb_full = try Framebuffer.init(gpa, width, height);
+    defer fb_full.deinit(gpa);
+    const motion_buffers = [_]*Framebuffer{ &fb_quarter, &fb_half, &fb_full };
 
-    const diamante = Material{
-        .Color = V3FromColor(htmlColor("#aaa")),
-        .Propiedades = .{
-            .Albedo = 0,
-            .Especular = 0.5,
-            .Reflectividad = 0.1,
-            .Transparencia = 0.8,
-        },
-        .Especular = 125,
-        .Refractive_index = 2.417,
-    };
+    var camera: Camera = .init(.{ .x = 0, .y = 0, .z = 14 }, target);
 
-    const marmol = Material{
-        .Color = V3FromColor(htmlColor("#66664c")),
-        .Propiedades = .{
-            .Albedo = 0.4,
-            .Especular = 0.3,
-            .Reflectividad = 0,
-            .Transparencia = 0,
-        },
-        .Especular = 10,
-        .Refractive_index = 0,
-    };
+    // La cámara orbita alrededor del diorama
+    var camera_x_angle: f32 = default_x_angle;
+    var camera_y_angle: f32 = default_y_angle;
+    var camera_distance: f32 = default_distance;
 
-    const spheres = [_]Forma{
-        .{ .Sphere = .{
-            .center = .{ .x = 10, .y = 0, .z = -40 },
-            .radius = 5,
-            .material = espejo,
-        } },
-        .{ .Sphere = .{
-            .center = .{ .x = 12.5, .y = 0, .z = -60 },
-            .radius = 5,
-            .material = .{
-                .Color = V3FromColor(htmlColor("#4c1919")),
-                .Propiedades = .{
-                    .Albedo = 0.9,
-                    .Especular = 0.1,
-                    .Reflectividad = 0,
-                    .Transparencia = 0,
-                },
-                .Especular = 10,
-                .Refractive_index = 0,
-            },
-        } },
-        .{ .Sphere = .{
-            .center = .{ .x = 0, .y = 0, .z = 0 },
-            .radius = 5,
-            .material = marmol,
-        } },
-        .{ .Sphere = .{
-            .center = .{ .x = 22, .y = 0, .z = -45 },
-            .radius = 5,
-            .material = espejo,
-        } },
-        .{ .Sphere = .{
-            .center = .{ .x = -25, .y = 0, .z = -40 },
-            .radius = 5,
-            .material = vidrio,
-        } },
-        .{ .Sphere = .{
-            .center = .{ .x = -37, .y = 0, .z = -40 },
-            .radius = 5,
-            .material = diamante,
-        } },
-    };
+    const camera_turn_speed: f32 = std.math.pi / 2.0;
+    const camera_y_angle_min: f32 = 0.05;
+    const camera_y_angle_max: f32 = 1.4;
 
-    const lights = [_]Light{
-        .{
-            .Color = V3FromColor(htmlColor("#f00")),
-            .Intensity = 1,
-            .Position = .{ .x = 5, .y = 100, .z = 15 },
-        },
-        .{
-            .Color = V3FromColor(htmlColor("#fff")),
-            .Intensity = 1,
-            .Position = .{ .x = 0, .y = 0, .z = -250 },
-        },
-    };
+    var auto_rotate = false;
+    var motion_scale_index: usize = 1;
+    var show_hud = true;
 
-    const cameraDistance = 100;
-    var camera: Camera = .init(.{
-        .x = 0,
-        .y = 0,
-        .z = cameraDistance,
-    }, .zero());
-
-    const cameraTurnSpeed: f32 = std.math.pi / 2.0;
-    var camera_x_angle: f32 = std.math.pi;
-    var camera_y_angle: f32 = 0;
-
-    const camera_y_angle_max = std.math.pi / 4.0;
-    const camera_y_angle_min = -camera_y_angle_max;
+    var displayed: *Framebuffer = &fb_full;
+    var full_resolution_ready = false;
+    var render_ms: f64 = 0;
 
     while (!rl.windowShouldClose()) {
-        defer {
-            const now = Clock.now(io);
-            delta = last_frame_time.durationTo(now).toMicroseconds();
-            last_frame_time = now;
-        }
-        framebuffer.clear();
+        const dt = rl.getFrameTime();
+        var moved = false;
 
-        const dt: f32 = @as(f32, @floatFromInt(delta)) / 1_000_000;
-
+        // --- Rotación ---
         if (rl.isKeyDown(.a)) {
-            camera_x_angle += cameraTurnSpeed * dt;
+            camera_x_angle += camera_turn_speed * dt;
+            moved = true;
         }
         if (rl.isKeyDown(.d)) {
-            camera_x_angle -= cameraTurnSpeed * dt;
+            camera_x_angle -= camera_turn_speed * dt;
+            moved = true;
         }
         if (rl.isKeyDown(.w)) {
-            camera_y_angle += cameraTurnSpeed * dt;
-            camera_y_angle = @max(camera_y_angle_min, @min(camera_y_angle_max, camera_y_angle));
+            camera_y_angle += camera_turn_speed * dt;
+            moved = true;
         }
         if (rl.isKeyDown(.s)) {
-            camera_y_angle -= cameraTurnSpeed * dt;
-            camera_y_angle = @max(camera_y_angle_min, @min(camera_y_angle_max, camera_y_angle));
+            camera_y_angle -= camera_turn_speed * dt;
+            moved = true;
         }
-
-        camera.Postition.x = @cos(camera_x_angle) * cameraDistance;
-        camera.Postition.y = @sin(camera_y_angle) * cameraDistance;
-        camera.Postition.z = @sin(camera_x_angle) * cameraDistance;
-
-        camera.lookAt(.zero());
-
-        try render(&framebuffer, &spheres, &lights, camera);
-
-        try framebuffer.swap_buffers();
-    }
-}
-
-fn render(target: *Framebuffer, objects: []const Forma, lights: []const Light, camera: Camera) !void {
-    const width_f32: f32 = @floatFromInt(target.width);
-    const height_f32: f32 = @floatFromInt(target.height);
-
-    const aspect_ratio = width_f32 / height_f32;
-    const FOV = std.math.pi / 3.0;
-    const perspective_scale = @tan(FOV * 0.5);
-
-    for (0..height) |screen_y| {
-        for (0..width) |screen_x| {
-            const x_f32: f32 = @floatFromInt(screen_x);
-            const y_f32: f32 = @floatFromInt(screen_y);
-
-            const x_minus1_to_1 = (x_f32 * 2) / width_f32 - 1;
-            const y_minus1_to_1 = 1 - (y_f32 * 2) / height_f32;
-
-            const x_direction = x_minus1_to_1 * aspect_ratio * perspective_scale;
-            const y_direction = y_minus1_to_1 * perspective_scale;
-
-            const direction_from_camera = (rl.Vector3{
-                .x = x_direction,
-                .y = y_direction,
-                .z = 1,
-            }).normalize();
-
-            const direction = rl.Vector3{
-                .x = direction_from_camera.x * camera.Right.x + direction_from_camera.y * camera.Up.x + direction_from_camera.z * camera.Forward.x,
-                .y = direction_from_camera.x * camera.Right.y + direction_from_camera.y * camera.Up.y + direction_from_camera.z * camera.Forward.y,
-                .z = direction_from_camera.x * camera.Right.z + direction_from_camera.y * camera.Up.z + direction_from_camera.z * camera.Forward.z,
-            };
-
-            const col = cast_ray(camera.Postition, direction, objects, lights, 5);
-            target.set_current_color(V3ToColor(col));
-            try target.set_pixel(@intCast(screen_x), @intCast(screen_y));
-        }
-    }
-}
-
-fn reflect(incident: rl.Vector3, normal: rl.Vector3) rl.Vector3 {
-    return incident.subtract(normal.scale(2 * incident.dotProduct(normal)));
-}
-
-fn refract(incident: rl.Vector3, normal: rl.Vector3, refractive_index: f32) ?rl.Vector3 {
-    var cosi = incident.dotProduct(normal);
-
-    var etai: f32 = 1;
-    var etat = refractive_index;
-    var n = normal;
-
-    if (cosi > 0) {
-        std.mem.swap(f32, &etai, &etat);
-        n = n.scale(-1);
-    } else {
-        cosi = -cosi;
-    }
-
-    const eta = etai / etat;
-    const k = 1 - eta * eta * (1 - cosi * cosi);
-
-    if (k < 0) {
-        return null;
-    } else {
-        return (incident.scale(eta).add(n.scale(eta * cosi - @sqrt(k)))).normalize();
-    }
-}
-
-fn cast_ray(origin: rl.Vector3, direction: rl.Vector3, objects: []const Forma, lights: []const Light, max_recursion: usize) rl.Vector3 {
-    var closest_hit: ?Intersect = null;
-    var z_buffer: f32 = std.math.floatMax(f32);
-    for (objects) |object| {
-        const hit = object.intersect(
-            origin,
-            direction,
-        ) orelse continue;
-
-        if (hit.Distancia < z_buffer) {
-            z_buffer = hit.Distancia;
-
-            closest_hit = hit;
-        }
-    }
-
-    if (closest_hit) |hit| {
-        const mat = hit.Material;
-        var color: rl.Vector3 = .zero();
-
-        // Desde el punto a la cámara
-        const view_direction = direction.scale(-1);
-
-        if (mat.Propiedades.Reflectividad > 0) {
-            if (max_recursion > 0) {
-                const reflect_direction = rl.Vector3{ .x = 0, .y = 1, .z = 0 };
-                const new_og = hit.Punto; // Esto puede hacer que topemos con la misma figura
-                // Eso es malo
-                const reflect_color = cast_ray(new_og, reflect_direction, objects, lights, max_recursion - 1);
-                color = color.add(reflect_color.scale(mat.Propiedades.Reflectividad));
-            } else {
-                // Refleja el fondo
-                color = color.add(.zero());
+        if (rl.isMouseButtonDown(.left)) {
+            const delta = rl.getMouseDelta();
+            if (delta.x != 0 or delta.y != 0) {
+                camera_x_angle -= delta.x * 0.006;
+                camera_y_angle += delta.y * 0.006;
+                moved = true;
             }
         }
-
-        if (mat.Propiedades.Transparencia > 0) {
-            if (max_recursion > 0) {
-                if (refract(direction, hit.Normal, mat.Refractive_index)) |refract_direction| {
-                    const new_og = hit.Punto; // Esto puede hacer que topemos con la misma figura
-                    // Eso es malo
-                    const refract_color = cast_ray(new_og, refract_direction, objects, lights, max_recursion - 1);
-                    color = color.add(refract_color.scale(mat.Propiedades.Transparencia));
-                } else {
-                    const reflect_direction = rl.Vector3{ .x = 0, .y = 1, .z = 0 };
-                    const new_og = hit.Punto; // Esto puede hacer que topemos con la misma figura
-                    // Eso es malo
-                    const reflect_color = cast_ray(new_og, reflect_direction, objects, lights, max_recursion - 1);
-                    color = color.add(reflect_color.scale(mat.Propiedades.Reflectividad));
-                }
-            } else {
-                // Refleja el fondo
-                color = color.add(.zero());
-            }
+        if (rl.isKeyPressed(.r)) auto_rotate = !auto_rotate;
+        if (auto_rotate) {
+            camera_x_angle += 0.5 * dt;
+            moved = true;
         }
 
-        for (lights) |light| {
-            if (obscured(hit.Punto, light, objects))
-                continue;
-
-            // La dirección del punto a la luz
-            const light_dir = light.Position.subtract(hit.Punto).normalize();
-
-            // ¿Cómo sabemos qué tan "bien" nos pega la luz?
-            const diffuse_intensity = @max(0, hit.Normal.dotProduct(light_dir)) * light.Intensity;
-
-            const diffuse = mat.Color.scale(diffuse_intensity);
-
-            // Dirección a la que reflejamos la luz
-            const reflection_dir = reflect(light_dir.scale(-1), hit.Normal);
-
-            // ¿Qué tan liso es nuestro objeto?
-            // ¿Qué tan intensa y precisa es su relfexión especular?
-            const specular_intensity = std.math.pow(f32, @max(0, reflection_dir.dotProduct(view_direction)), mat.Especular) * light.Intensity;
-
-            const specular = light.Color.scale(specular_intensity);
-
-            // El cómo mezclar los objetos es más al gusto.
-            color = color.add(diffuse.scale(mat.Propiedades.Albedo));
-            color = color.add(specular.scale(mat.Propiedades.Especular));
+        // --- Zoom ---
+        const wheel = rl.getMouseWheelMove();
+        if (wheel != 0) {
+            camera_distance *= @exp(-wheel * 0.1);
+            moved = true;
+        }
+        if (rl.isKeyDown(.e) or rl.isKeyDown(.up)) {
+            camera_distance *= @exp(-1.2 * dt);
+            moved = true;
+        }
+        if (rl.isKeyDown(.q) or rl.isKeyDown(.down)) {
+            camera_distance *= @exp(1.2 * dt);
+            moved = true;
         }
 
-        return color;
-    } else return .zero();
-}
+        camera_y_angle = std.math.clamp(camera_y_angle, camera_y_angle_min, camera_y_angle_max);
+        camera_distance = std.math.clamp(camera_distance, distance_min, distance_max);
 
-fn obscured(origin: rl.Vector3, light: Light, objects: []const Forma) bool {
-    const to_light = light.Position.subtract(origin);
-    const light_distance = to_light.length();
-    const light_dir = to_light.normalize();
+        // --- Otros controles ---
+        if (rl.isKeyPressed(.m)) {
+            motion_scale_index = (motion_scale_index + 1) % motion_scales.len;
+            moved = true;
+        }
+        if (rl.isKeyPressed(.h)) show_hud = !show_hud;
+        if (rl.isKeyPressed(.p)) {
+            displayed.render_to_file("captura.png") catch {};
+        }
 
-    // Empujamos el origen un poco hacia la luz para no toparnos
-    // con la misma figura de la que salimos (shadow acne).
-    const shadow_origin = origin.add(light_dir.scale(1e-3));
+        placeCamera(&camera, camera_x_angle, camera_y_angle, camera_distance);
 
-    for (objects) |object| {
-        const hit = object.intersect(shadow_origin, light_dir) orelse continue;
-        if (hit.Distancia < light_distance) {
-            return true;
+        // --- Render ---
+        if (moved) {
+            displayed = motion_buffers[motion_scale_index];
+            full_resolution_ready = displayed == &fb_full;
+            const start = rl.getTime();
+            tracer.render(displayed, &scene, camera, thread_count);
+            render_ms = (rl.getTime() - start) * 1000;
+        } else if (!full_resolution_ready) {
+            displayed = &fb_full;
+            const start = rl.getTime();
+            tracer.render(displayed, &scene, camera, thread_count);
+            render_ms = (rl.getTime() - start) * 1000;
+            full_resolution_ready = true;
+        }
+
+        // --- Dibujar ---
+        rl.beginDrawing();
+        defer rl.endDrawing();
+
+        displayed.draw(width, height);
+
+        if (show_hud) {
+            var buf: [128]u8 = undefined;
+            const stats = std.fmt.bufPrintSentinel(
+                &buf,
+                "{d}x{d} | render {d:.0} ms | {d} hilos | zoom {d:.1}",
+                .{ displayed.width, displayed.height, render_ms, thread_count, camera_distance },
+                0,
+            ) catch "";
+            rl.drawText(stats, 11, 11, 18, .black);
+            rl.drawText(stats, 10, 10, 18, .white);
+            rl.drawText("A/D o arrastrar: rotar | W/S: inclinar | rueda o Q/E: zoom | R: giro automatico | M: calidad al mover | H: ocultar | P: captura", 11, height - 29, 16, .black);
+            rl.drawText("A/D o arrastrar: rotar | W/S: inclinar | rueda o Q/E: zoom | R: giro automatico | M: calidad al mover | H: ocultar | P: captura", 10, height - 30, 16, .white);
         }
     }
-
-    return false;
 }
